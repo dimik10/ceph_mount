@@ -1,0 +1,171 @@
+---
+- name: Run apt upgrade
+  apt:
+    upgrade: "no"
+    update_cache: yes
+    cache_valid_time: 432000
+
+- name: "Add an Apt signing key ceph"
+  ansible.builtin.apt_key:
+    url: http://srv.ru/archive/ceph/release.asc
+    state: present
+  when:  state == "mounted" and ansible_facts['lsb']['release'] == "18.04" or ansible_facts['lsb']['release'] == "20.04"
+
+- name: "find ceph repo"
+  ansible.builtin.find:
+    paths: /etc/apt/sources.list.d
+    patterns: "*ceph*"
+  register: find_results
+
+- name: "delete old ceph repo"
+  ansible.builtin.file:
+    path: "{{ item['path'] }}"
+    state: absent
+  with_items: "{{ find_results['files'] }}"
+
+- name: "add ceph repo Release 18.04 - {{ ansible_facts['lsb']['release'] }}"
+  ansible.builtin.apt_repository:
+    repo: deb http://srv/repo/mirror/eu.ceph.com/debian-pacific/ {{ hostvars[inventory_hostname].ansible_distribution_release }} main
+    state: present
+    filename: ceph
+    update_cache: true
+  when:  state == "mounted" and ansible_facts['lsb']['release'] == "18.04"
+
+- name: "add ceph repo Release 20.04 - {{ ansible_facts['lsb']['release'] }}"
+  ansible.builtin.apt_repository:
+    repo: deb http://srv/repo/mirror/eu.ceph.com/debian-quincy/ {{ hostvars[inventory_hostname].ansible_distribution_release }} main
+    update_cache: true
+    state: present
+    filename: ceph
+  when:  state == "mounted" and ansible_facts['lsb']['release'] == "20.04"
+
+- name: "Install dependencies ceph-common"
+  apt:
+    name:
+    - ceph-common
+    state: latest
+    update_cache: yes
+  when:  state == "mounted"
+
+- name: "Add /etc/ceph/{{ name_ceph }}.client.{{ name }}.keyring"
+  template:
+    src: "{{ name_ceph }}.client.{{ name }}.keyring.j2"
+    dest: "/etc/ceph/{{ name_ceph }}.client.{{ name }}.keyring"
+  when:  state == "mounted"
+
+- name: "Check path exist"
+  stat:
+    path: "{{ path }}"
+  register: register_path
+  when:  state == "mounted"
+
+- name: "Create directory {{ path }}"
+  file:
+    path: "{{ path }}"
+    state: directory
+    mode: 0775
+  when:
+    - state == "mounted"
+    - not register_path.stat.exists
+
+- name: "add line Block Mount {{ name_ceph }}"
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    line: "#Block Mount {{ name_ceph }}"
+    state: present
+  when:
+    - state == "mounted"
+
+- name: "rem line Block Mount {{ name_ceph }}"
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    line: "#Block Mount {{ name_ceph }}"
+    state: absent
+    regexp: "#Block Mount {{ name_ceph }}"
+  when:
+    - state == "absent"
+
+
+- name: "{{ state }} to {{ path }} Release - {{ ansible_facts['lsb']['release'] }}"
+  mount:
+    path: "{{ path }}"
+    src: "{{ src_ceph_ub18[name_ceph] }}:{{ dst }}"
+    fstype: ceph
+    opts: "name={{ name }},secretfile=/etc/ceph/{{ name_ceph }}.client.{{ name }}.keyring,rw,_netdev"
+    state: "{{ state }}"
+  when: ansible_facts['lsb']['release'] == "18.04"
+
+- name: "{{ state }} to {{ path }}  Release - {{ ansible_facts['lsb']['release'] }}"
+  mount:
+    path: "{{ path }}"
+    src: "{{ name }}@{{ id_ceph[name_ceph] }}.cephfs={{ dst }}"
+    fstype: ceph
+    opts: "mon_addr={{ src_ceph_ub20[name_ceph] }},secretfile=/etc/ceph/{{ name_ceph }}.client.{{ name }}.keyring"
+    state: "{{ state }}"
+  when: ansible_facts['lsb']['release'] == "22.04" or ansible_facts['lsb']['release'] == "20.04"
+
+- name: "Remove /etc/ceph/{{ name_ceph }}.client.{{ name }}.keyring"
+  file:
+    path: "/etc/ceph/{{ name_ceph }}.client.{{ name }}.keyring"
+    state: "{{ state }}"
+  when: state == "absent"
+
+- name: File acl {{ name_ceph }}.client.{{ name }}.keyring
+  file:
+    path: "/etc/ceph/{{ name_ceph }}.client.{{ name }}.keyring"
+    mode: 0640
+  when:  state == "mounted"
+
+
+- name: "Запуск проверки монтирования cephfs"
+  block:
+    - name: "create file {{ path }}"
+      ansible.builtin.lineinfile:
+        path: "{{ path }}/check_mount.txt"
+        line: check
+        create: yes
+
+    - name: "Проверка контрольной суммы файла в cephfs"
+      ansible.builtin.stat:
+         path: "{{ path }}/check_mount.txt"
+         checksum_algorithm: sha256
+      register: summ
+
+    - name: "Проверка что контрольная сумма сошлась, если не сошлась, то skip шаг"
+      ansible.builtin.debug:
+         msg: "Контрольная сумма {{ summ.stat.checksum }} сошлась с b78232388282c6420137ababfeb08b77a605007fe7650cfce4e36bb6afa013fb"
+      when:
+        - summ.stat.checksum == 'b78232388282c6420137ababfeb08b77a605007fe7650cfce4e36bb6afa013fb'
+
+
+    - name: "delete file check_mount.txt"
+      file:
+        path: "{{ path }}/check_mount.txt"
+        state: absent
+
+  rescue:
+    - name: "Восстановление монтирования."
+      ansible.builtin.shell:  |
+         set -e -o pipefail
+         umount "{{ path }}"
+         mount "{{ path }}"
+         exit 0
+
+    - name: "Повторная Проверка контрольной суммы cephfs"
+      ansible.builtin.stat:
+        path: "{{ path }}/check_mount.txt"
+        checksum_algorithm: sha256
+      register: summ
+
+
+    - name: "Повторная Проверка что контрольная сумма сошлась, если не сошлась, то skip шаг"
+      ansible.builtin.debug:
+        msg: "Контрольная сумма {{ summ.stat.checksum }} сошлась с b78232388282c6420137ababfeb08b77a605007fe7650cfce4e36bb6afa013fa"
+      when: summ.stat.checksum == 'b78232388282c6420137ababfeb08b77a605007fe7650cfce4e36bb6afa013fa'
+
+    - name: "delete file check_mount.txt"
+      file:
+        path: "{{ path }}/check_mount.txt"
+        state: absent
+  when: state == "mounted" and name | regex_search('rw', multiline=True, ignorecase=True) #тут проверка что ключ с возможностью записи
+  ignore_errors: true
